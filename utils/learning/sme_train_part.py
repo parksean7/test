@@ -68,58 +68,60 @@ def compute_sme_input(kspace, center_slice_idx, num_adjacent=5):
     return sme_input
 
 
-def estimate_sensitivity_maps(kspace, mask, num_adjacent=5):
+def estimate_sensitivity_maps(kspace, mask=None, num_adjacent=5):
     """
-    Estimate sensitivity maps from k-space data for ground truth
+    Estimate coil sensitivity maps from multi-coil k-space.
+
+    Args:
+        kspace: [B, C, H, W, 2] if real/imag format, or [B, C, H, W] if complex.
+        mask: (ignored here)
+        num_adjacent: (unused here)
+
+    Returns:
+        sens_maps_real: [B, C, H, W, 2] real/imag representation of sensitivity maps
     """
-    batch_size, coils, height, width, complex_dim = kspace.shape
+    if kspace.ndim != 5 or kspace.shape[-1] != 2:
+        raise ValueError("Expected kspace shape [B, C, H, W, 2]")
+
+    B, C, H, W, _ = kspace.shape
     device = kspace.device
-    
-    # Convert to complex if needed
-    if complex_dim == 2:
-        kspace_complex = kspace[..., 0] + 1j * kspace[..., 1]
-    else:
-        kspace_complex = kspace
-    
-    # Use center k-space region for sensitivity estimation
-    center_fraction = 0.08  # Use 8% of center k-space
-    center_lines = int(height * center_fraction)
-    start_line = (height - center_lines) // 2
+
+    # Convert to complex tensor
+    kspace_complex = torch.view_as_complex(kspace)
+
+    # Use center k-space region
+    center_fraction = 0.08
+    center_lines = int(H * center_fraction)
+    start_line = (H - center_lines) // 2
     end_line = start_line + center_lines
-    
-    # Extract center k-space
-    center_kspace = kspace_complex[:, :, start_line:end_line, :].clone()
-    
-    # Inverse FFT to get low-resolution images
+
+    center_kspace = kspace_complex[:, :, start_line:end_line, :]
+
+    # IFFT2 to get low-res coil images
     center_images = torch.fft.ifftshift(
-        torch.fft.ifft2(
-            torch.fft.fftshift(center_kspace, dim=(-2, -1)), 
-            dim=(-2, -1)
-        ), 
+        torch.fft.ifft2(torch.fft.fftshift(center_kspace, dim=(-2, -1)), dim=(-2, -1)),
         dim=(-2, -1)
-    )
-    
-    # Resize to full resolution
+    )  # shape: [B, C, h_center, W], dtype: complex64
+
+    # Magnitude before interpolation
+    center_magnitude = torch.abs(center_images)  # [B, C, h_center, W], float
+
+    # Upsample to full resolution
+    target_size = (768, 384)
     center_images_full = torch.nn.functional.interpolate(
-        center_images.abs().unsqueeze(1),
-        size=(height, width),
-        mode='bilinear',
-        align_corners=False
-    ).squeeze(1)
-    
-    # Compute RSS for normalization
+        center_magnitude, size=target_size, mode="bilinear", align_corners=False
+    )  # [B, C, H, W], float
+
+    # Normalize via root-sum-of-squares (RSS)
     rss = torch.sqrt(torch.sum(center_images_full ** 2, dim=1, keepdim=True))
     rss = torch.clamp(rss, min=1e-8)
-    
-    # Sensitivity maps
-    sens_maps = center_images_full / rss
-    
-    # Convert back to real/imaginary format [B, coils, H, W, 2]
-    sens_maps_real = sens_maps.unsqueeze(-1) * torch.stack([
-        torch.ones_like(sens_maps), 
-        torch.zeros_like(sens_maps)
-    ], dim=-1)
-    
+
+    # Sensitivity map = coil image / RSS
+    sens_maps = center_images_full / rss  # [B, C, H, W], float
+
+    # Convert to complex: real part only, imaginary part = 0
+    sens_maps_real = torch.stack([sens_maps, torch.zeros_like(sens_maps)], dim=-1)  # [B, C, H, W, 2]
+
     return sens_maps_real
 
 
