@@ -33,8 +33,8 @@ def parse():
     
     # Data parameters
     parser.add_argument('--input-key', type=str, default='kspace', help='Name of input key')
-    parser.add_argument('--target-key', type=str, default='image_label', help='Name of target key')
-    parser.add_argument('--max-key', type=str, default='max', help='Name of max key in attributes')
+    parser.add_argument('--target-key', type=str, default='reconstruction_rss', help='Target key for reconstruction')
+    parser.add_argument('--max-key', type=str, default='max_value', help='Max key for normalization')
     parser.add_argument('--seed', type=int, default=430, help='Fix random seed')
     
     # Loss parameters

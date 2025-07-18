@@ -1,163 +1,132 @@
-"""
-Updated data loading module for PromptMR+
-Maintains original structure while fixing critical issues
-"""
-
 import h5py
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-import torch
-import pathlib
 import random
-
+from utils.data.transforms import DataTransform
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+import numpy as np
 
 class SliceData(Dataset):
-    def __init__(self, root, num_adjacent=5, transform=None, use_dataset_cache=True):
+    def __init__(self, root, transform, input_key, target_key, forward=False, num_adjacent=5):
         self.transform = transform
+        self.input_key = input_key
+        self.target_key = target_key
+        self.forward = forward
         self.num_adjacent = num_adjacent
-        self.examples = []
+        self.image_examples = []
+        self.kspace_examples = []
+        
+        root_path = Path(root)
+        print(f"Loading data from: {root_path}")
+        
+        # Load image files (for targets) if not in forward mode
+        if not forward:
+            image_dir = root_path / "image"
+            if image_dir.exists():
+                image_files = list(image_dir.glob("*.h5"))
+                print(f"Found {len(image_files)} image files")
+                for fname in sorted(image_files):
+                    try:
+                        num_slices = self._get_metadata(fname)
+                        if num_slices > 0:
+                            self.image_examples += [
+                                (fname, slice_ind) for slice_ind in range(num_slices)
+                            ]
+                    except Exception as e:
+                        print(f"Error reading image file {fname}: {e}")
+            else:
+                print(f"Warning: Image directory {image_dir} does not exist")
 
-        files = list(pathlib.Path(root).iterdir())
-        for fname in sorted(files):
-            if fname.suffix == '.h5':
-                with h5py.File(fname, 'r') as hf:
-                    if 'kspace' in hf:
-                        num_slices = hf['kspace'].shape[0]
-                        self.examples += [(fname, slice_idx) for slice_idx in range(num_slices)]
+        # Load kspace files
+        kspace_dir = root_path / "kspace"
+        if kspace_dir.exists():
+            kspace_files = list(kspace_dir.glob("*.h5"))
+            print(f"Found {len(kspace_files)} kspace files")
+            for fname in sorted(kspace_files):
+                try:
+                    num_slices = self._get_metadata(fname)
+                    if num_slices > 0:
+                        self.kspace_examples += [
+                            (fname, slice_ind) for slice_ind in range(num_slices)
+                        ]
+                except Exception as e:
+                    print(f"Error reading kspace file {fname}: {e}")
+        else:
+            print(f"Error: Kspace directory {kspace_dir} does not exist")
+            
+        print(f"Total image examples: {len(self.image_examples)}")
+        print(f"Total kspace examples: {len(self.kspace_examples)}")
+        
+        if len(self.kspace_examples) == 0:
+            raise ValueError(f"No valid kspace files found in {kspace_dir}")
+
+    def _get_metadata(self, fname):
+        try:
+            with h5py.File(fname, "r") as hf:
+                if self.input_key in hf.keys():
+                    num_slices = hf[self.input_key].shape[0]
+                elif self.target_key in hf.keys():
+                    num_slices = hf[self.target_key].shape[0]
+                else:
+                    # Debug: print available keys
+                    print(f"Available keys in {fname.name}: {list(hf.keys())}")
+                    num_slices = 0
+                return num_slices
+        except Exception as e:
+            print(f"Error reading metadata from {fname}: {e}")
+            return 0
 
     def __len__(self):
-        return len(self.examples)
+        return len(self.kspace_examples)
 
     def __getitem__(self, i):
-        fname, slice_idx = self.examples[i]
+        kspace_fname, dataslice = self.kspace_examples[i]
         
-        with h5py.File(fname, 'r') as hf:
-            # Load k-space data
-            kspace = hf['kspace'][()]
+        # For training mode, find matching image file
+        if not self.forward:
+            # Find matching image file by name
+            kspace_basename = kspace_fname.stem  # e.g., "brain_acc4_1"
+            image_fname = None
             
-            # Get adjacent slices
-            kspace_adj = self._get_adjacent_slices(kspace, slice_idx)
+            for img_fname, img_slice in self.image_examples:
+                if img_fname.stem == kspace_basename and img_slice == dataslice:
+                    image_fname = img_fname
+                    break
             
-            # Create mask (you should load or generate proper mask here)
-            mask = self._create_mask(kspace_adj.shape)
-            
-            # Apply mask to k-space
-            masked_kspace = kspace_adj * mask[..., None]
-            
-            # Get target
-            if 'reconstruction_rss' in hf:
-                target = hf['reconstruction_rss'][slice_idx]
-            else:
-                # Zero-filled reconstruction as target for test data
-                target = self._get_zero_filled_reconstruction(kspace[slice_idx])
-            
-            # Get maximum value for normalization
-            if 'max' in hf.attrs:
-                maximum = hf.attrs['max']
-            else:
-                maximum = np.max(np.abs(target))
-            
-            # Create SME input (magnitude images of adjacent slices)
-            sme_input = self._create_sme_input(kspace_adj)
-            
-        # Convert to tensors
-        masked_kspace = torch.from_numpy(masked_kspace).float()
-        mask = torch.from_numpy(mask).float()
-        target = torch.from_numpy(target).float()
-        maximum = torch.tensor(maximum).float()
-        sme_input = torch.from_numpy(sme_input).float()
-        
-        # Return with proper format matching your train_part.py expectations
-        # (mask, kspace, target, maximum, fname, slice, sme_input)
-        return mask, masked_kspace, target, maximum, fname.name, slice_idx, sme_input
+            if image_fname is None:
+                # If exact match not found, try to find by basename only
+                for img_fname, img_slice in self.image_examples:
+                    if img_fname.stem == kspace_basename:
+                        image_fname = img_fname
+                        break
+                        
+            if image_fname is None:
+                raise ValueError(f"No matching image file found for kspace file {kspace_fname.name}")
 
-    def _get_adjacent_slices(self, kspace, slice_idx):
-        """Get adjacent slices with proper handling of boundaries"""
-        num_slices, num_coils, h, w = kspace.shape
-        half_adj = self.num_adjacent // 2
-        
-        # Collect adjacent slices
-        slices = []
-        for offset in range(-half_adj, half_adj + 1):
-            idx = slice_idx + offset
-            # Handle boundaries by clamping
-            idx = max(0, min(idx, num_slices - 1))
-            slices.append(kspace[idx])
-        
-        # Stack and reshape: [num_adj, coils, H, W] -> [coils*num_adj, H, W]
-        kspace_adj = np.concatenate(slices, axis=0)
-        
-        # Convert complex to real representation if needed
-        if np.iscomplexobj(kspace_adj):
-            kspace_adj = np.stack([kspace_adj.real, kspace_adj.imag], axis=-1)
-        elif kspace_adj.shape[-1] != 2:
-            # If not complex and doesn't have last dim 2, add it
-            kspace_adj = np.stack([kspace_adj, np.zeros_like(kspace_adj)], axis=-1)
-            
-        return kspace_adj
+        # Load kspace data
+        try:
+            with h5py.File(kspace_fname, "r") as hf:
+                input_data = hf[self.input_key][dataslice]
+                mask = np.array(hf["mask"])
+        except Exception as e:
+            print(f"Error loading kspace data from {kspace_fname}: {e}")
+            raise
 
-    def _create_mask(self, shape):
-        """Create undersampling mask"""
-        # Simple center + random mask for now
-        # You should use your actual mask generation
-        mask = np.zeros((1, shape[-2], 1), dtype=np.float32)
-        
-        # Center lines (ACS)
-        center = shape[-2] // 2
-        num_center = 24  # Adjust based on your acceleration
-        mask[:, center - num_center//2:center + num_center//2, :] = 1
-        
-        # Random lines
-        acceleration = 4  # Adjust based on your needs
-        num_lines = shape[-2] // acceleration
-        indices = np.random.choice(shape[-2], num_lines - num_center, replace=False)
-        mask[:, indices, :] = 1
-        
-        return mask
-
-    def _get_zero_filled_reconstruction(self, kspace_slice):
-        """Get zero-filled reconstruction from k-space"""
-        # Convert to image space
-        if np.iscomplexobj(kspace_slice):
-            image = np.fft.ifftshift(np.fft.ifft2(np.fft.fftshift(kspace_slice, axes=(-2, -1)), axes=(-2, -1)), axes=(-2, -1))
-            # Root sum of squares combination
-            return np.sqrt(np.sum(np.abs(image)**2, axis=0))
+        # Load target data
+        if self.forward:
+            target = -1
+            attrs = -1
         else:
-            # If not complex, assume it's already in image space
-            return np.sqrt(np.sum(kspace_slice**2, axis=0))
-
-    def _create_sme_input(self, kspace_adj):
-        """Create input for sensitivity map estimation"""
-        # Convert to image space and take magnitude
-        # Shape: [coils*num_adj, H, W, 2] -> [num_adj, H, W]
-        coils_per_adj = kspace_adj.shape[0] // self.num_adjacent
-        
-        sme_input = []
-        for i in range(self.num_adjacent):
-            start_idx = i * coils_per_adj
-            end_idx = (i + 1) * coils_per_adj
+            try:
+                with h5py.File(image_fname, "r") as hf:
+                    target = hf[self.target_key][dataslice]
+                    attrs = dict(hf.attrs)
+            except Exception as e:
+                print(f"Error loading image data from {image_fname}: {e}")
+                # Create dummy target to prevent crash
+                target = np.zeros(input_data.shape[-2:], dtype=np.float32)
+                attrs = {}
             
-            # Get k-space for this adjacent slice
-            k_slice = kspace_adj[start_idx:end_idx]
-            
-            # Convert to complex if in real representation
-            if k_slice.shape[-1] == 2:
-                k_complex = k_slice[..., 0] + 1j * k_slice[..., 1]
-            else:
-                k_complex = k_slice
-            
-            # IFFT to image space
-            img = np.fft.ifftshift(np.fft.ifft2(np.fft.fftshift(k_complex, axes=(-2, -1)), axes=(-2, -1)), axes=(-2, -1))
-            
-            # RSS combination
-            rss = np.sqrt(np.sum(np.abs(img)**2, axis=0))
-            sme_input.append(rss)
-        
-        # Stack to [num_adj, H, W]
-        sme_input = np.stack(sme_input, axis=0)
-        
-        # Add channel dimension to match expected format [1, num_adj, H, W]
-        return np.expand_dims(sme_input, axis=0)
+        return self.transform(mask, input_data, target, attrs, kspace_fname.name, dataslice)
 
 
 def create_data_loaders(data_path, args, shuffle=False, isforward=False):
@@ -168,15 +137,18 @@ def create_data_loaders(data_path, args, shuffle=False, isforward=False):
         # For forward/test mode
         dataset = SliceData(
             root=data_path,
-            num_adjacent=getattr(args, 'num_adjacent', 5),
-            transform=None
+            transform=DataTransform(isforward, -1),
+            input_key=args.input_key,
+            target_key=-1,
+            forward=True,
+            num_adjacent=getattr(args, 'num_adjacent', 5)
         )
         
         data_loader = DataLoader(
             dataset=dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=2,
             pin_memory=True
         )
         
@@ -186,21 +158,27 @@ def create_data_loaders(data_path, args, shuffle=False, isforward=False):
         # For training - return both train and val loaders
         train_data = SliceData(
             root=args.data_path_train,
-            num_adjacent=getattr(args, 'num_adjacent', 5),
-            transform=None
+            transform=DataTransform(False, args.max_key),
+            input_key=args.input_key,
+            target_key=args.target_key,
+            forward=False,
+            num_adjacent=getattr(args, 'num_adjacent', 5)
         )
         
         val_data = SliceData(
             root=args.data_path_val,
-            num_adjacent=getattr(args, 'num_adjacent', 5),
-            transform=None
+            transform=DataTransform(False, args.max_key),
+            input_key=args.input_key,
+            target_key=args.target_key,
+            forward=False,
+            num_adjacent=getattr(args, 'num_adjacent', 5)
         )
         
         train_loader = DataLoader(
             dataset=train_data,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=2,
             pin_memory=True,
             drop_last=True
         )
@@ -209,7 +187,7 @@ def create_data_loaders(data_path, args, shuffle=False, isforward=False):
             dataset=val_data,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=2,
             pin_memory=True
         )
         
@@ -218,7 +196,7 @@ def create_data_loaders(data_path, args, shuffle=False, isforward=False):
             dataset=val_data,
             batch_size=1,
             shuffle=False,
-            num_workers=4,
+            num_workers=1,
             pin_memory=True
         )
         
