@@ -261,18 +261,22 @@ def mask_center(x: torch.Tensor, mask_from: Optional[int], mask_to: Optional[int
 
 def center_crop(data: torch.Tensor, shape: tuple) -> torch.Tensor:
     """
-    Apply a center crop to 2D images
+    Apply a center crop to 2D images.
+    Args:
+        data: Tensor with shape (..., H, W)
+        shape: Desired output shape (H, W)
+    Returns:
+        Center-cropped tensor with shape (..., H_crop, W_crop)
     """
     if data.shape[-2:] == shape:
         return data
-    
-    w_from = (data.shape[-2] - shape[0]) // 2
-    h_from = (data.shape[-1] - shape[1]) // 2
-    w_to = w_from + shape[0]
-    h_to = h_from + shape[1]
-    
-    return data[..., w_from:w_to, h_from:h_to]
 
+    h_from = (data.shape[-2] - shape[0]) // 2
+    w_from = (data.shape[-1] - shape[1]) // 2
+    h_to = h_from + shape[0]
+    w_to = w_from + shape[1]
+
+    return data[..., h_from:h_to, w_from:w_to]
 
 def complex_center_crop(data: torch.Tensor, shape: tuple) -> torch.Tensor:
     """

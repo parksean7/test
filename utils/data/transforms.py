@@ -55,7 +55,7 @@ class DataTransform:
         sme_input_slices = []
         for slice_idx in range(kspace_sos.shape[0]):
             # IFFT to get image
-            image = torch.fft.ifft2(kspace_sos[slice_idx], norm='ortho')  # [H, W] complex
+            image = torch.fft.ifft2(kspace_sos, norm='ortho')
             # Stack real/imag
             image_real_imag = torch.stack([image.real, image.imag], dim=0)  # [2, H, W]
             sme_input_slices.append(image_real_imag)
@@ -77,4 +77,4 @@ class DataTransform:
         mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, height, width)
         
         # Return both formats: reconstructor format as main, SME format as additional
-        return mask_tensor, kspace, target, maximum, fname, slice, sme_input
+        return mask_tensor, kspace, target, maximum, fname, slice_idx

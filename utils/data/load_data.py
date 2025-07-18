@@ -12,121 +12,63 @@ class SliceData(Dataset):
         self.target_key = target_key
         self.forward = forward
         self.num_adjacent = num_adjacent
-        self.image_examples = []
-        self.kspace_examples = []
-        
+        self.examples = []
+
         root_path = Path(root)
         print(f"Loading data from: {root_path}")
-        
-        # Load image files (for targets) if not in forward mode
-        if not forward:
-            image_dir = root_path / "image"
-            if image_dir.exists():
-                image_files = list(image_dir.glob("*.h5"))
-                print(f"Found {len(image_files)} image files")
-                for fname in sorted(image_files):
-                    try:
-                        num_slices = self._get_metadata(fname)
-                        if num_slices > 0:
-                            self.image_examples += [
-                                (fname, slice_ind) for slice_ind in range(num_slices)
-                            ]
-                    except Exception as e:
-                        print(f"Error reading image file {fname}: {e}")
-            else:
-                print(f"Warning: Image directory {image_dir} does not exist")
 
-        # Load kspace files
-        kspace_dir = root_path / "kspace"
-        if kspace_dir.exists():
-            kspace_files = list(kspace_dir.glob("*.h5"))
-            print(f"Found {len(kspace_files)} kspace files")
-            for fname in sorted(kspace_files):
-                try:
-                    num_slices = self._get_metadata(fname)
-                    if num_slices > 0:
-                        self.kspace_examples += [
-                            (fname, slice_ind) for slice_ind in range(num_slices)
-                        ]
-                except Exception as e:
-                    print(f"Error reading kspace file {fname}: {e}")
-        else:
-            print(f"Error: Kspace directory {kspace_dir} does not exist")
-            
-        print(f"Total image examples: {len(self.image_examples)}")
-        print(f"Total kspace examples: {len(self.kspace_examples)}")
-        
-        if len(self.kspace_examples) == 0:
-            raise ValueError(f"No valid kspace files found in {kspace_dir}")
+        h5_files = sorted(root_path.glob("*.h5"))
+        print(f"Found {len(h5_files)} .h5 files")
+
+        for fname in h5_files:
+            try:
+                num_slices = self._get_metadata(fname)
+                if num_slices > 0:
+                    self.examples += [(fname, slice_idx) for slice_idx in range(num_slices)]
+            except Exception as e:
+                print(f"Error reading file {fname}: {e}")
+
+        print(f"Total examples: {len(self.examples)}")
+        if len(self.examples) == 0:
+            raise ValueError(f"No valid .h5 files found in {root_path}")
 
     def _get_metadata(self, fname):
         try:
             with h5py.File(fname, "r") as hf:
-                if self.input_key in hf.keys():
-                    num_slices = hf[self.input_key].shape[0]
-                elif self.target_key in hf.keys():
-                    num_slices = hf[self.target_key].shape[0]
+                if self.input_key in hf:
+                    return hf[self.input_key].shape[0]
+                elif not self.forward and self.target_key in hf:
+                    return hf[self.target_key].shape[0]
                 else:
-                    # Debug: print available keys
-                    print(f"Available keys in {fname.name}: {list(hf.keys())}")
-                    num_slices = 0
-                return num_slices
+                    print(f"Missing keys in {fname.name}: {list(hf.keys())}")
+                    return 0
         except Exception as e:
             print(f"Error reading metadata from {fname}: {e}")
             return 0
 
     def __len__(self):
-        return len(self.kspace_examples)
+        return len(self.examples)
 
     def __getitem__(self, i):
-        kspace_fname, dataslice = self.kspace_examples[i]
-        
-        # For training mode, find matching image file
-        if not self.forward:
-            # Find matching image file by name
-            kspace_basename = kspace_fname.stem  # e.g., "brain_acc4_1"
-            image_fname = None
-            
-            for img_fname, img_slice in self.image_examples:
-                if img_fname.stem == kspace_basename and img_slice == dataslice:
-                    image_fname = img_fname
-                    break
-            
-            if image_fname is None:
-                # If exact match not found, try to find by basename only
-                for img_fname, img_slice in self.image_examples:
-                    if img_fname.stem == kspace_basename:
-                        image_fname = img_fname
-                        break
-                        
-            if image_fname is None:
-                raise ValueError(f"No matching image file found for kspace file {kspace_fname.name}")
+        fname, slice_idx = self.examples[i]
 
-        # Load kspace data
         try:
-            with h5py.File(kspace_fname, "r") as hf:
-                input_data = hf[self.input_key][dataslice]
-                mask = np.array(hf["mask"])
-        except Exception as e:
-            print(f"Error loading kspace data from {kspace_fname}: {e}")
-            raise
-
-        # Load target data
-        if self.forward:
-            target = -1
-            attrs = -1
-        else:
-            try:
-                with h5py.File(image_fname, "r") as hf:
-                    target = hf[self.target_key][dataslice]
+            with h5py.File(fname, "r") as hf:
+                input_data = hf[self.input_key][slice_idx]
+                mask = np.array(hf["mask"]) if "mask" in hf else np.ones_like(input_data)
+                if self.forward:
+                    target = -1
+                    attrs = -1
+                else:
+                    target = hf[self.target_key][slice_idx]
                     attrs = dict(hf.attrs)
-            except Exception as e:
-                print(f"Error loading image data from {image_fname}: {e}")
-                # Create dummy target to prevent crash
-                target = np.zeros(input_data.shape[-2:], dtype=np.float32)
-                attrs = {}
-            
-        return self.transform(mask, input_data, target, attrs, kspace_fname.name, dataslice)
+        except Exception as e:
+            print(f"Error loading data from {fname}: {e}")
+            target = np.zeros(input_data.shape[-2:], dtype=np.float32)
+            attrs = {}
+
+        return self.transform(mask, input_data, target, attrs, fname.name, slice_idx)
+
 
 
 def create_data_loaders(data_path, args, shuffle=False, isforward=False):
