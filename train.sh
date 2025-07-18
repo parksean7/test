@@ -1,0 +1,12 @@
+python train.py \
+  -b 1 \
+  -e 15 \
+  -l 3e-4 \
+  -r 10 \
+  -n 'promptmr_plus' \
+  -t '/root/Data/train/' \
+  -v '/root/Data/val/' \
+  --model-type 'promptmr_plus' \
+  --cascade 5 \
+  --chans 8 \
+  --sens_chans 3
