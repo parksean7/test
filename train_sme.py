@@ -43,6 +43,7 @@ def parse():
     # Memory optimization parameters
     parser.add_argument('--enable-checkpointing', action='store_true', help='Enable gradient checkpointing for memory efficiency')
     parser.add_argument('--reduce-precision', action='store_true', help='Use reduced precision for memory efficiency')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=1, help='Number of gradient accumulation steps')
     
     # Early stopping parameters
     parser.add_argument('--patience', type=int, default=10, help='Number of epochs to wait before early stopping')
@@ -77,6 +78,7 @@ if __name__ == '__main__':
     print(f"Loss Type: {args.loss_type}")
     print(f"Epochs: {args.num_epochs}")
     print(f"Learning Rate: {args.lr}")
+    print(f"Gradient Accumulation Steps: {args.gradient_accumulation_steps}")
     print("="*60)
 
     train_sme(args)

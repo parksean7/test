@@ -19,13 +19,14 @@ python train_sme.py \
     --num_adjacent 5 \
     --loss-type mse \
     --enable-checkpointing \
+    --gradient-accumulation-steps 2 \
     --data-path-train /root/Data/train/ \
     --data-path-val /root/Data/val/ \
     --net-name sme_model_modified \
     --report-interval 50 \
     --target-key kspace \
     --max-key max_value \
-    --patience 10 \
+    --patience 5 \
     --min-delta 1e-6
 
 echo "SME training completed!"

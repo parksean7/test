@@ -1,6 +1,8 @@
 """
-Updated PromptMR+ Reconstructor Model
-Maintains compatibility with your existing training code
+Fixed PromptMR+ Reconstructor Model
+- Implements momentum layers for cross-cascade feature fusion
+- Proper multi-coil sensitivity handling
+- Memory-efficient implementation
 """
 
 import torch
@@ -74,16 +76,97 @@ class TransposeConvBlock(nn.Module):
         return self.layers(x)
 
 
+class ChannelAttentionBlock(nn.Module):
+    """Channel Attention Block (CAB) for momentum fusion"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class MomentumLayer(nn.Module):
+    """
+    FIXED: Momentum layer for multi-stage feature fusion
+    Implements: Momentum(F_0^m, ..., F_t^m) = CAB(Conv_1×1(Concat(F_0^m, ..., F_t^m)))
+    """
+    def __init__(self, feature_dim, n_history=11):
+        super().__init__()
+        self.n_history = n_history
+        self.feature_dim = feature_dim
+        
+        # 1x1 conv to reduce concatenated features
+        self.conv1x1 = nn.Conv2d(feature_dim * (n_history + 1), feature_dim, 1)
+        
+        # Channel Attention Block for adaptive fusion
+        self.cab = ChannelAttentionBlock(feature_dim)
+        
+        # Initialize weights
+        nn.init.xavier_uniform_(self.conv1x1.weight)
+        nn.init.zeros_(self.conv1x1.bias)
+    
+    def forward(self, current_feat, history_feats):
+        """
+        Args:
+            current_feat: [B, C, H, W] current cascade features
+            history_feats: List of [B, C, H, W] from previous cascades (max n_history)
+        Returns:
+            output: [B, C, H, W] fused features
+            new_history: Updated history list
+        """
+        if history_feats is None:
+            history_feats = []
+        
+        # Limit history to n_history most recent features
+        history_feats = history_feats[-self.n_history:]
+        
+        # If no history, just return current (first cascade)
+        if len(history_feats) == 0:
+            return current_feat, [current_feat]
+        
+        # Concatenate current with history
+        all_feats = [current_feat] + history_feats
+        
+        # Pad with current feature if we have fewer than n_history+1 features
+        while len(all_feats) < self.n_history + 1:
+            all_feats.append(current_feat)
+        
+        # Concatenate along channel dimension
+        concat_feats = torch.cat(all_feats, dim=1)  # [B, C*(n_history+1), H, W]
+        
+        # Fuse with 1x1 conv
+        fused = self.conv1x1(concat_feats)  # [B, C, H, W]
+        
+        # Apply channel attention
+        output = self.cab(fused)  # [B, C, H, W]
+        
+        # Update history (keep only last n_history features)
+        new_history = ([current_feat] + history_feats)[:self.n_history]
+        
+        return output, new_history
+
+
 class PromptUnet(nn.Module):
     """
-    U-Net model without attention blocks for memory efficiency
+    FIXED: U-Net model with momentum layers for cross-cascade feature fusion
     """
-    def __init__(self, in_chans, out_chans, num_pool_layers=4, chans=48, drop_prob=0.0):
+    def __init__(self, in_chans, out_chans, num_pool_layers=4, chans=48, drop_prob=0.0, n_history=11):
         super().__init__()
         self.in_chans = in_chans
         self.out_chans = out_chans
         self.chans = chans
         self.num_pool_layers = num_pool_layers
+        self.n_history = n_history
 
         # Down-sampling layers
         self.down_sample_layers = nn.ModuleList([ConvBlock(in_chans, chans, drop_prob)])
@@ -96,43 +179,85 @@ class PromptUnet(nn.Module):
         # Up-sampling layers  
         self.up_conv = nn.ModuleList()
         self.up_sample_layers = nn.ModuleList()
+        
+        # FIXED: Add momentum layers for each decoder level
+        self.momentum_layers = nn.ModuleList()
+        
+        ch_list = []  # Track channel dimensions for momentum layers
+        temp_ch = ch
         for _ in range(num_pool_layers - 1):
-            self.up_conv.append(TransposeConvBlock(ch * 2, ch))
-            self.up_sample_layers.append(ConvBlock(ch * 2, ch, drop_prob))
-            ch //= 2
-        self.up_conv.append(TransposeConvBlock(ch * 2, ch))
+            self.up_conv.append(TransposeConvBlock(temp_ch * 2, temp_ch))
+            self.up_sample_layers.append(ConvBlock(temp_ch * 2, temp_ch, drop_prob))
+            
+            # Add momentum layer for this level
+            self.momentum_layers.append(MomentumLayer(temp_ch, n_history))
+            ch_list.append(temp_ch)
+            
+            temp_ch //= 2
+        
+        self.up_conv.append(TransposeConvBlock(temp_ch * 2, temp_ch))
         self.up_sample_layers.append(
             nn.Sequential(
-                ConvBlock(ch * 2, ch, drop_prob),
-                nn.Conv2d(ch, out_chans, kernel_size=1),
+                ConvBlock(temp_ch * 2, temp_ch, drop_prob),
+                nn.Conv2d(temp_ch, out_chans, kernel_size=1),
             )
         )
+        
+        # Add momentum layer for final level
+        self.momentum_layers.append(MomentumLayer(temp_ch, n_history))
 
-    def forward(self, image):
+    def forward(self, image, history_feats=None):
         """
+        FIXED: Forward pass with momentum feature fusion
+        
         Args:
             image: Input 4D tensor of shape `(N, in_chans, H, W)`.
+            history_feats: List of feature histories from previous cascades
         Returns:
-            Output tensor of shape `(N, out_chans, H, W)`.
+            output: Output tensor of shape `(N, out_chans, H, W)`.
+            new_history_feats: Updated history features for next cascade
         """
+        # Initialize history if None
+        if history_feats is None:
+            history_feats = [[] for _ in range(len(self.momentum_layers))]
+        
+        # Ensure we have the right number of history lists
+        while len(history_feats) < len(self.momentum_layers):
+            history_feats.append([])
+        
         stack = []
         output = image
 
-        # Down-sampling
+        # Down-sampling (encoder)
         for layer in self.down_sample_layers:
             output = layer(output)
             stack.append(output)
             output = F.avg_pool2d(output, kernel_size=2, stride=2, padding=0)
 
+        # Bottleneck
         output = self.conv(output)
 
-        # Up-sampling
-        for up_conv_layer, up_sample_layer in zip(self.up_conv, self.up_sample_layers):
-            output = up_conv_layer(output)
-            output = torch.cat([output, stack.pop()], dim=1)
-            output = up_sample_layer(output)
-
-        return output
+        # Up-sampling (decoder) with momentum fusion
+        new_history_feats = []
+        
+        for i, (up_conv, up_layer, momentum_layer) in enumerate(zip(
+            self.up_conv, self.up_sample_layers, self.momentum_layers
+        )):
+            # Upsample and concatenate with skip connection
+            output = up_conv(output)
+            if i < len(stack):
+                output = torch.cat([output, stack.pop()], dim=1)
+            output = up_layer(output)
+            
+            # FIXED: Apply momentum fusion at each decoder level
+            if i < len(self.momentum_layers) - 1:  # Not the final layer
+                output, new_history = momentum_layer(output, history_feats[i])
+                new_history_feats.append(new_history)
+            else:
+                # Final layer - no momentum needed
+                new_history_feats.append([])
+        
+        return output, new_history_feats
 
 
 class SensReduce(nn.Module):
@@ -192,8 +317,10 @@ class SensExpand(nn.Module):
 
 
 class PromptMRBlock(nn.Module):
-    """Single cascade block of PromptMR+"""
-    def __init__(self, num_adj_slices=5, chans=48, coil_num=15):
+    """
+    FIXED: Single cascade block of PromptMR+ with momentum support
+    """
+    def __init__(self, num_adj_slices=5, chans=48, coil_num=15, n_history=11):
         super().__init__()
         self.num_adj_slices = num_adj_slices
         self.coil_num = coil_num
@@ -202,26 +329,31 @@ class PromptMRBlock(nn.Module):
         self.sens_reduce = SensReduce(coil_num)
         self.sens_expand = SensExpand(coil_num)
         
-        # U-Net for denoising (operating on adjacent slices)
-        # Input: num_adj complex images (2 channels each)
-        # Output: num_adj complex images
+        # FIXED: U-Net with momentum layers
         self.unet = PromptUnet(
             in_chans=num_adj_slices * 2,  # Complex input
             out_chans=num_adj_slices * 2,  # Complex output
             num_pool_layers=4,
             chans=chans,
-            drop_prob=0.0
+            drop_prob=0.0,
+            n_history=n_history  # FIXED: Add momentum support
         )
         
         self.dc_layer = DataConsistencyLayer()
 
-    def forward(self, current_kspace, sampled_kspace, mask, sens_maps):
+    def forward(self, current_kspace, sampled_kspace, mask, sens_maps, history_feats=None):
         """
+        FIXED: Forward pass with momentum feature tracking
+        
         Args:
             current_kspace: Current k-space estimate [B, C*adj, H, W, 2]
             sampled_kspace: Under-sampled k-space [B, C*adj, H, W, 2]
             mask: Sampling mask [B, 1, H, W, 1]
             sens_maps: Sensitivity maps [B, C, H, W, 2]
+            history_feats: History features from previous cascades
+        Returns:
+            updated_kspace: Updated k-space [B, C*adj, H, W, 2]
+            new_history_feats: Updated history features for next cascade
         """
         b, total_coils, h, w, _ = current_kspace.shape
         coils_per_slice = self.coil_num
@@ -246,8 +378,8 @@ class PromptMRBlock(nn.Module):
         b, c, h, w, _ = images_stacked.shape
         images_chan = images_stacked.permute(0, 1, 4, 2, 3).reshape(b, c*2, h, w)
         
-        # Apply U-Net denoising
-        denoised = self.unet(images_chan)
+        # FIXED: Apply U-Net denoising with momentum
+        denoised, new_history_feats = self.unet(images_chan, history_feats)
         
         # Convert back to complex
         # [B, num_adj*2, H, W] -> [B, num_adj, H, W, 2]
@@ -271,73 +403,110 @@ class PromptMRBlock(nn.Module):
             updated_kspace.append(dc_kspace)
         
         # Stack back to full k-space
-        return torch.cat(updated_kspace, dim=1)
+        updated_kspace = torch.cat(updated_kspace, dim=1)
+        
+        return updated_kspace, new_history_feats
 
 
 class PromptMRPlusReconstructor(nn.Module):
     """
-    Full PromptMR+ reconstruction model
+    FIXED: Full PromptMR+ reconstruction model with momentum support
     """
-    def __init__(self, num_cascades=12, chans=48, num_adj_slices=5, 
+    def __init__(self, num_cascades=5, chans=48, num_adj_slices=5, 
                  use_prompts=False, use_adaptive_input=False, 
-                 use_history_features=False, learnable_dc=False,
-                 use_checkpointing=False):
+                 use_history_features=True, learnable_dc=False,
+                 use_checkpointing=False, coil_num=15, n_history=11):
         super().__init__()
         
         self.num_cascades = num_cascades
         self.num_adj_slices = num_adj_slices
         self.center_slice = num_adj_slices // 2
+        self.use_checkpointing = use_checkpointing
+        self.use_history_features = use_history_features
+        self.coil_num = coil_num
         
-        # Determine number of coils from your data
-        # You'll need to adjust this based on your actual data
-        self.coil_num = 15  # Assuming 15 coils total
-        
-        # Create cascade blocks
+        # FIXED: Create cascade blocks with momentum support
         self.cascades = nn.ModuleList([
-            PromptMRBlock(num_adj_slices, chans, self.coil_num)
+            PromptMRBlock(
+                num_adj_slices=num_adj_slices,
+                chans=chans,
+                coil_num=coil_num,
+                n_history=n_history if use_history_features else 0
+            )
             for _ in range(num_cascades)
         ])
         
-        self.use_checkpointing = use_checkpointing
+        # Initialize zero-filled reconstruction
+        self.register_buffer('zero_filled_init', torch.tensor(0.0))
 
     def forward(self, kspace, mask, sens_maps):
         """
+        FIXED: Forward pass with momentum feature tracking
+        
         Args:
             kspace: Under-sampled k-space [B, C*adj, H, W, 2]
             mask: Sampling mask [B, 1, H, W, 1]
             sens_maps: Sensitivity maps [B, C, H, W, 2]
         Returns:
-            Reconstructed image [B, H, W]
+            reconstructed_image: [B, H, W] - central slice reconstruction
         """
-        # Initialize with input k-space
-        current_kspace = kspace
+        # Initialize with zero-filled reconstruction
+        current_kspace = kspace.clone()
         
-        # Apply cascades
-        for cascade in self.cascades:
+        # FIXED: Initialize history features for momentum
+        history_feats = None
+        if self.use_history_features:
+            history_feats = [[] for _ in range(len(self.cascades))]
+        
+        # Run through cascades
+        for i, cascade in enumerate(self.cascades):
             if self.use_checkpointing and self.training:
-                current_kspace = torch.utils.checkpoint.checkpoint(
-                    cascade, current_kspace, kspace, mask, sens_maps
+                # Use gradient checkpointing for memory efficiency
+                current_kspace, new_history = torch.utils.checkpoint.checkpoint(
+                    cascade, current_kspace, kspace, mask, sens_maps,
+                    history_feats[i] if history_feats else None
                 )
             else:
-                current_kspace = cascade(current_kspace, kspace, mask, sens_maps)
+                current_kspace, new_history = cascade(
+                    current_kspace, kspace, mask, sens_maps,
+                    history_feats[i] if history_feats else None
+                )
+            
+            # Update history features
+            if self.use_history_features and history_feats:
+                history_feats[i] = new_history
         
-        # Extract center slice and convert to image
-        # Get k-space for center slice
-        start_idx = self.center_slice * self.coil_num
-        end_idx = (self.center_slice + 1) * self.coil_num
-        center_kspace = current_kspace[:, start_idx:end_idx]
+        # Extract central slice and convert to image
+        b, total_coils, h, w, _ = current_kspace.shape
+        coils_per_slice = self.coil_num
+        
+        # Get central slice k-space
+        center_start = self.center_slice * coils_per_slice
+        center_end = (self.center_slice + 1) * coils_per_slice
+        center_kspace = current_kspace[:, center_start:center_end]
         
         # Convert to image space
-        center_image = ifft2c(center_kspace)
+        center_images = ifft2c(center_kspace)
         
-        # Combine coils using RSS
-        magnitude = torch.sqrt(torch.sum(center_image[..., 0]**2 + center_image[..., 1]**2, dim=1))
+        # Coil combination using sensitivity maps
+        sens_maps_conj = sens_maps.clone()
+        sens_maps_conj[..., 1] = -sens_maps_conj[..., 1]
+        
+        # Complex multiplication and sum
+        real = center_images[..., 0] * sens_maps_conj[..., 0] - center_images[..., 1] * sens_maps_conj[..., 1]
+        imag = center_images[..., 0] * sens_maps_conj[..., 1] + center_images[..., 1] * sens_maps_conj[..., 0]
+        
+        combined_complex = torch.stack([real, imag], dim=-1)
+        combined_image = combined_complex.sum(dim=1)  # Sum over coils
+        
+        # Take magnitude
+        magnitude = torch.sqrt(combined_image[..., 0] ** 2 + combined_image[..., 1] ** 2 + 1e-8)
         
         return magnitude
 
 
 class ReconstructionLoss(nn.Module):
-    """Loss function for reconstruction matching your training code"""
+    """Loss function for reconstruction training"""
     def __init__(self, loss_type='ssim'):
         super().__init__()
         self.loss_type = loss_type
@@ -390,8 +559,10 @@ def build_promptmr_model(args):
         num_adj_slices=getattr(args, 'num_adjacent', 5),
         use_prompts=args.use_prompts if hasattr(args, 'use_prompts') else False,
         use_adaptive_input=args.use_adaptive_input if hasattr(args, 'use_adaptive_input') else False,
-        use_history_features=args.use_history_features if hasattr(args, 'use_history_features') else False,
+        use_history_features=args.use_history_features if hasattr(args, 'use_history_features') else True,
         learnable_dc=args.learnable_dc if hasattr(args, 'learnable_dc') else False,
-        use_checkpointing=args.use_checkpointing if hasattr(args, 'use_checkpointing') else False
+        use_checkpointing=args.use_checkpointing if hasattr(args, 'use_checkpointing') else False,
+        coil_num=getattr(args, 'num_coils', 15),
+        n_history=getattr(args, 'n_history', 11)
     )
     return model

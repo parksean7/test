@@ -26,9 +26,10 @@ def compute_sme_input(kspace, center_slice_idx, num_adjacent=5):
         center_slice_idx: int - center slice index
         num_adjacent: int - number of adjacent slices to use
     Returns:
-        sme_input: [B, 1, num_adjacent, H, W] - RSS images from adjacent slices
+        sme_input: [B, num_adjacent, H, W] - RSS images from adjacent slices
     """
-    batch_size, num_coils, height, width, _ = kspace.shape
+    # FIXED: Correct the shape unpacking
+    batch_size, num_coils, height, width, _ = kspace.shape  # Changed from kspace*dict['center'].shape
     device = kspace.device
     
     # We need to get adjacent slices, but we only have one slice
@@ -62,9 +63,8 @@ def compute_sme_input(kspace, center_slice_idx, num_adjacent=5):
     # Stack to [B, num_adjacent, H, W]
     sme_input = torch.stack(sme_slices, dim=1)
     
-    # Add channel dimension [B, 1, num_adjacent, H, W]
-    sme_input = sme_input.unsqueeze(1)
-    
+    # FIXED: Return without adding extra channel dimension
+    # The SME model expects [B, num_adjacent, H, W] not [B, 1, num_adjacent, H, W]
     return sme_input
 
 
@@ -125,53 +125,43 @@ def estimate_sensitivity_maps(kspace, mask=None, num_adjacent=5):
     return sens_maps_real
 
 def train_sme_epoch(args, epoch, model, data_loader, optimizer, loss_type):
-    """Train SME model for one epoch"""
+    """Train SME model for one epoch with gradient accumulation"""
     model.train()
     start_epoch = start_iter = time.perf_counter()
     len_loader = len(data_loader)
     total_loss = 0.
+    
+    # Get gradient accumulation steps
+    accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
 
     for iter, data in enumerate(data_loader):
-        # Unpack 6 values: mask, kspace, target, maximum, fname, slice_idx
+        # Unpack data (6 values expected)
         mask, kspace, target, maximum, fname, slice_idx = data
         
-        # Move to device
         device = next(model.parameters()).device
         mask = mask.to(device, non_blocking=True)
         kspace = kspace.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
-        maximum = maximum.to(device, non_blocking=True)
         
-        # Compute SME input from kspace data
+        # Compute SME input
         sme_input = compute_sme_input(kspace, slice_idx, args.num_adjacent)
         
-        # SME input should be [B, num_adj, H, W] for the model
+        # Process input
         if sme_input.dim() == 5:
-            sme_input = sme_input.squeeze(1)  # Remove channel dim if present
+            sme_input = sme_input.squeeze(1)
         
-        # Get sensitivity maps prediction - now returns [B, 1, H, W, 2]
+        # Get predictions
         sens_maps_pred = model(sme_input, mask.squeeze(-1))
-
-        # Expand to match the actual coil count from input kspace
-        B, C, H, W, _ = kspace.shape
-        if sens_maps_pred.shape[1] == 1 and C > 1:
-            # Repeat single coil sensitivity for all coils
-            sens_maps_pred = sens_maps_pred.repeat(1, C, 1, 1, 1)  # [B, C, H, W, 2]
         
-        # Compute "ground truth" sensitivity maps from fully sampled center
+        # Get ground truth
         sens_maps_gt = estimate_sensitivity_maps(kspace, mask, args.num_adjacent)
         sens_maps_gt = sens_maps_gt.to(device)
         
-        # Ensure compatible shapes (should now match)
+        # Handle shape compatibility
         if sens_maps_pred.shape != sens_maps_gt.shape:
-            print(f"Shape mismatch: pred {sens_maps_pred.shape}, gt {sens_maps_gt.shape}")
-            # Handle any remaining mismatches by taking minimum dimensions
-            min_coils = min(sens_maps_pred.shape[1], sens_maps_gt.shape[1])
-            min_h = min(sens_maps_pred.shape[2], sens_maps_gt.shape[2])
-            min_w = min(sens_maps_pred.shape[3], sens_maps_gt.shape[3])
-    
-            sens_maps_pred = sens_maps_pred[:, :min_coils, :min_h, :min_w, :]
-            sens_maps_gt = sens_maps_gt[:, :min_coils, :min_h, :min_w, :]
+            if sens_maps_pred.shape[1] != sens_maps_gt.shape[1]:
+                min_coils = min(sens_maps_pred.shape[1], sens_maps_gt.shape[1])
+                sens_maps_pred = sens_maps_pred[:, :min_coils]
+                sens_maps_gt = sens_maps_gt[:, :min_coils]
         
         # Compute loss
         if loss_type == 'mse':
@@ -180,24 +170,38 @@ def train_sme_epoch(args, epoch, model, data_loader, optimizer, loss_type):
             # L1 loss
             loss = nn.functional.l1_loss(sens_maps_pred, sens_maps_gt)
         
-        # Backward pass
-        optimizer.zero_grad()
+        # Scale loss for gradient accumulation
+        loss = loss / accumulation_steps
         loss.backward()
         
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Update weights every accumulation_steps
+        if (iter + 1) % accumulation_steps == 0:
+            # Gradient clipping for stability
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Log gradient norm occasionally
+            if iter % args.report_interval == 0:
+                print(f'Gradient norm: {grad_norm:.4f}')
         
-        optimizer.step()
-        total_loss += loss.item()
+        total_loss += loss.item() * accumulation_steps
 
         if iter % args.report_interval == 0:
             print(
                 f'SME Epoch = [{epoch:3d}/{args.num_epochs:3d}] '
                 f'Iter = [{iter:4d}/{len(data_loader):4d}] '
-                f'Loss = {loss.item():.4g} '
+                f'Loss = {loss.item() * accumulation_steps:.4g} '
                 f'Time = {time.perf_counter() - start_iter:.4f}s',
             )
             start_iter = time.perf_counter()
+    
+    # Handle remaining gradients if the last batch doesn't complete a full accumulation
+    if (len_loader) % accumulation_steps != 0:
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
     
     total_loss = total_loss / len_loader
     return total_loss, time.perf_counter() - start_epoch

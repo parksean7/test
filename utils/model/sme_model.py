@@ -1,28 +1,24 @@
 """
-Updated Sensitivity Map Estimation (SME) Model for PromptMR+
-Fixed to match PromptMR+ architecture properly
+Fixed SME Model Implementation
+- Fixes shape compatibility issues
+- Properly outputs multi-coil sensitivity maps
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Optional, Tuple
-
-from .unet import Unet
+from typing import Optional, List, Tuple
 
 
 class ConvBlock(nn.Module):
     """
-    A Convolutional Block that consists of two convolution layers each followed by
-    instance normalization, LeakyReLU activation and dropout.
+    A Convolutional Block that consists of convolution layers each followed by
+    instance normalization, LeakyReLU activation.
     """
-    def __init__(self, in_chans: int, out_chans: int, drop_prob: float):
+    def __init__(self, in_chans, out_chans, drop_prob=0.0):
         super().__init__()
-
         self.in_chans = in_chans
         self.out_chans = out_chans
-        self.drop_prob = drop_prob
 
         self.layers = nn.Sequential(
             nn.Conv2d(in_chans, out_chans, kernel_size=3, padding=1, bias=False),
@@ -35,68 +31,59 @@ class ConvBlock(nn.Module):
             nn.Dropout2d(drop_prob),
         )
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
+    def forward(self, image):
         return self.layers(image)
 
 
+class TransposeConvBlock(nn.Module):
+    """Transpose convolution block for upsampling"""
+    def __init__(self, in_chans, out_chans):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.ConvTranspose2d(in_chans, out_chans, kernel_size=2, stride=2),
+            nn.InstanceNorm2d(out_chans),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        )
+    
+    def forward(self, x):
+        return self.layers(x)
+
+
 class PromptBlock(nn.Module):
-    """Prompt block for adaptive feature learning"""
-    def __init__(self, in_channels: int, prompt_dim: int = 16):
+    """Simple prompt block for learning adaptive features"""
+    def __init__(self, in_chans, prompt_dim=8):
         super().__init__()
         self.prompt_dim = prompt_dim
+        self.prompt_conv = nn.Conv2d(in_chans, prompt_dim, kernel_size=1)
+        self.output_conv = nn.Conv2d(in_chans + prompt_dim, in_chans, kernel_size=1)
         
-        # Learnable prompt parameters
-        self.prompt_param = nn.Parameter(torch.randn(1, prompt_dim, 1, 1) * 0.02)
-        
-        # Channel attention for prompt
-        self.channel_attention = nn.Sequential(
-            nn.Conv2d(in_channels, prompt_dim, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(prompt_dim, in_channels, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Generate prompt based on input
-        b, c, h, w = x.shape
-        prompt = self.prompt_param.expand(b, -1, h, w)
-        
-        # Apply channel attention
-        attention = self.channel_attention(x)
-        
-        # Modulate input with prompt
-        return x * attention + x
+    def forward(self, x):
+        prompt = self.prompt_conv(x)
+        combined = torch.cat([x, prompt], dim=1)
+        return self.output_conv(combined)
 
 
-class NormUnet(nn.Module):
+class SMEUnet(nn.Module):
     """
-    Normalized U-Net model for sensitivity map estimation
+    U-Net for sensitivity map estimation
     """
-    def __init__(
-        self,
-        chans: int,
-        num_pools: int,
-        in_chans: int = 2,
-        out_chans: int = 2,
-        drop_prob: float = 0.0,
-        use_prompts: bool = True
-    ):
+    def __init__(self, in_chans, out_chans, num_pool_layers=4, chans=32, drop_prob=0.0, use_prompts=True):
         super().__init__()
-        self.use_prompts = use_prompts
         self.in_chans = in_chans
         self.out_chans = out_chans
         self.chans = chans
-        self.num_pools = num_pools
+        self.num_pool_layers = num_pool_layers
+        self.use_prompts = use_prompts
 
-        # Input prompt block
-        if use_prompts:
+        # Prompt blocks
+        if self.use_prompts:
             self.input_prompt = PromptBlock(in_chans, prompt_dim=8)
             self.output_prompt = PromptBlock(out_chans, prompt_dim=8)
 
         # Down-sampling path
         self.down_sample_layers = nn.ModuleList([ConvBlock(in_chans, chans, drop_prob)])
         ch = chans
-        for _ in range(num_pools - 1):
+        for _ in range(num_pool_layers - 1):
             self.down_sample_layers.append(ConvBlock(ch, ch * 2, drop_prob))
             ch *= 2
         self.conv = ConvBlock(ch, ch * 2, drop_prob)
@@ -104,12 +91,12 @@ class NormUnet(nn.Module):
         # Up-sampling path
         self.up_conv = nn.ModuleList()
         self.up_sample_layers = nn.ModuleList()
-        for _ in range(num_pools - 1):
-            self.up_conv.append(nn.ConvTranspose2d(ch * 2, ch, kernel_size=2, stride=2))
+        for _ in range(num_pool_layers - 1):
+            self.up_conv.append(TransposeConvBlock(ch * 2, ch))
             self.up_sample_layers.append(ConvBlock(ch * 2, ch, drop_prob))
             ch //= 2
         
-        self.up_conv.append(nn.ConvTranspose2d(ch * 2, ch, kernel_size=2, stride=2))
+        self.up_conv.append(TransposeConvBlock(ch * 2, ch))
         self.up_sample_layers.append(
             nn.Sequential(
                 ConvBlock(ch * 2, ch, drop_prob),
@@ -119,6 +106,8 @@ class NormUnet(nn.Module):
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
+        FIXED: Forward pass with proper size handling for skip connections
+        
         Args:
             image: Input 4D tensor of shape `(N, in_chans, H, W)`.
         Returns:
@@ -131,18 +120,37 @@ class NormUnet(nn.Module):
         stack = []
         output = image
 
-        # Down-sampling
+        # Down-sampling (encoder)
         for layer in self.down_sample_layers:
             output = layer(output)
             stack.append(output)
             output = F.avg_pool2d(output, kernel_size=2, stride=2, padding=0)
 
+        # Bottleneck
         output = self.conv(output)
 
-        # Up-sampling
+        # Up-sampling (decoder) with proper size matching
         for up_conv, up_layer in zip(self.up_conv, self.up_sample_layers):
+            # Upsample
             output = up_conv(output)
-            output = torch.cat([output, stack.pop()], dim=1)
+            
+            # Get skip connection feature
+            skip_feat = stack.pop()
+            
+            # FIXED: Ensure spatial dimensions match before concatenation
+            if output.shape[2:] != skip_feat.shape[2:]:
+                # Resize output to match skip connection size
+                output = F.interpolate(
+                    output, 
+                    size=skip_feat.shape[2:], 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+            
+            # Concatenate along channel dimension
+            output = torch.cat([output, skip_feat], dim=1)
+            
+            # Apply conv layers
             output = up_layer(output)
 
         # Apply output prompt if enabled
@@ -154,7 +162,7 @@ class NormUnet(nn.Module):
 
 class SensitivityModel(nn.Module):
     """
-    Model for sensitivity map estimation that matches PromptMR+ architecture
+    FIXED: Model for sensitivity map estimation that properly outputs multi-coil maps
     """
     def __init__(
         self,
@@ -162,89 +170,93 @@ class SensitivityModel(nn.Module):
         num_pools: int = 4,
         drop_prob: float = 0.0,
         num_adjacent: int = 5,
-        use_prompts: bool = True
+        use_prompts: bool = True,
+        num_coils: int = 15  # FIXED: Add num_coils parameter
     ):
         super().__init__()
         
         self.num_adjacent = num_adjacent
-        self.num_pools = num_pools  # ADD THIS LINE
+        self.num_pools = num_pools
         self.use_prompts = use_prompts
+        self.num_coils = num_coils  # FIXED: Store num_coils
         
-        # Important: Match the expected input/output channels
-        # Input: magnitude images from adjacent slices
-        # Output: complex sensitivity maps (real + imag)
-        in_chans = num_adjacent  # One magnitude image per adjacent slice
-        out_chans = 2  # Complex output (real + imaginary)
+        # FIXED: Input is magnitude images from adjacent slices
+        # Output should be complex sensitivity maps for all coils
+        in_chans = num_adjacent  # Adjacent RSS magnitude images
+        out_chans = num_coils * 2  # Real and imaginary parts for each coil
         
-        # Build the normalized U-Net
-        self.norm_unet = NormUnet(
-            chans=chans,
-            num_pools=num_pools,
+        self.unet = SMEUnet(
             in_chans=in_chans,
             out_chans=out_chans,
+            num_pool_layers=num_pools,
+            chans=chans,
             drop_prob=drop_prob,
             use_prompts=use_prompts
         )
         
-        # Additional normalization for output
-        self.output_norm = nn.InstanceNorm2d(out_chans)
+        # FIXED: Initialize sensitivity maps with proper normalization
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+            if m.bias is not None:  # ← Add this check
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.InstanceNorm2d):
+            if m.weight is not None:  # ← Add this check
+                nn.init.constant_(m.weight, 1)
+            if m.bias is not None:    # ← Add this check
+                nn.init.constant_(m.bias, 0)
 
-    def forward(self, input_images: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
+        FIXED: Forward pass for sensitivity map estimation
+        
         Args:
-            input_images: Magnitude images [B, num_adjacent, H, W]
-            mask: Sampling mask [B, H, W] or [B, 1, H, W]
+            x: Adjacent RSS magnitude images [B, num_adjacent, H, W]
+            mask: Sampling mask (not used in current implementation)
         Returns:
-            sens_maps: Sensitivity maps [B, 1, H, W, 2] (will be expanded later)
+            Sensitivity maps [B, num_coils, H, W, 2]
         """
-        b, n_adj, h, w = input_images.shape
-    
-        # Calculate padding needed for U-Net compatibility
-        # U-Net with num_pools requires dimensions divisible by 2^num_pools
-        pad_factor = 2 ** self.num_pools  # 16 for num_pools=4
-    
-        # Calculate padding for height and width
-        pad_h = (pad_factor - (h % pad_factor)) % pad_factor
-        pad_w = (pad_factor - (w % pad_factor)) % pad_factor
-    
-        # Apply padding if needed
-        if pad_h > 0 or pad_w > 0:
-            # Pad: (left, right, top, bottom)
-            padding = (0, pad_w, 0, pad_h)
-            input_padded = F.pad(input_images, padding, mode='reflect')
-        else:
-            input_padded = input_images
-    
-        # Process through U-Net
-        sens_output = self.norm_unet(input_padded)  # [B, 2, H_pad, W_pad]
-    
-        # Crop back to original dimensions if padding was applied
-        if pad_h > 0 or pad_w > 0:
-            sens_output = sens_output[:, :, :h, :w]  # [B, 2, H, W]
-    
-        # Normalize output
-        sens_output = self.output_norm(sens_output)
-    
-        # Apply activation to ensure unit norm
-        # Split real and imaginary parts
-        sens_real = sens_output[:, 0:1, :, :]  # [B, 1, H, W]
-        sens_imag = sens_output[:, 1:2, :, :]  # [B, 1, H, W]
-    
-        # Normalize to unit norm
-        sens_mag = torch.sqrt(sens_real**2 + sens_imag**2 + 1e-8)
-        sens_real = sens_real / sens_mag
-        sens_imag = sens_imag / sens_mag
-    
-        # Stack to create complex representation
-        sens_maps = torch.stack([sens_real, sens_imag], dim=-1)  # [B, 1, H, W, 2]
-    
-        return sens_maps
-
-    def complex_to_chan_dim(self, x: torch.Tensor) -> torch.Tensor:
-        """Convert complex tensor to channel dimension."""
-        b, c, h, w, two = x.shape
-        assert two == 2
-        return x.permute(0, 1, 4, 2, 3).reshape(b, c * 2, h, w)
+        B, num_adj, H, W = x.shape
+        
+        # Ensure we have the right number of adjacent slices
+        if num_adj != self.num_adjacent:
+            if num_adj < self.num_adjacent:
+                # Pad with repeated slices
+                pad_slices = self.num_adjacent - num_adj
+                x = torch.cat([x, x[:, -1:].repeat(1, pad_slices, 1, 1)], dim=1)
+            else:
+                # Truncate to required number
+                x = x[:, :self.num_adjacent]
+        
+        # Forward through U-Net
+        # Input: [B, num_adjacent, H, W]
+        # Output: [B, num_coils*2, H, W]
+        sens_maps_flat = self.unet(x)
+        
+        # FIXED: Reshape to proper sensitivity map format
+        # [B, num_coils*2, H, W] -> [B, num_coils, H, W, 2]
+        sens_maps = sens_maps_flat.view(B, self.num_coils, 2, H, W)
+        sens_maps = sens_maps.permute(0, 1, 3, 4, 2).contiguous()
+        
+        # FIXED: Apply proper normalization for sensitivity maps
+        # Compute RSS and normalize
+        sens_magnitude = torch.sqrt(
+            sens_maps[..., 0] ** 2 + sens_maps[..., 1] ** 2 + 1e-8
+        )  # [B, num_coils, H, W]
+        
+        # RSS across coils
+        rss = torch.sqrt(torch.sum(sens_magnitude ** 2, dim=1, keepdim=True) + 1e-8)
+        
+        # Normalize sensitivity maps
+        sens_maps_real = sens_maps[..., 0] / rss
+        sens_maps_imag = sens_maps[..., 1] / rss
+        
+        # Stack back to complex format
+        sens_maps_normalized = torch.stack([sens_maps_real, sens_maps_imag], dim=-1)
+        
+        return sens_maps_normalized
 
     def chan_complex_to_last_dim(self, x: torch.Tensor) -> torch.Tensor:
         """Convert channel dimension to complex tensor."""
@@ -253,14 +265,24 @@ class SensitivityModel(nn.Module):
         c = c2 // 2
         return x.view(b, c, 2, h, w).permute(0, 1, 3, 4, 2).contiguous()
 
+    def complex_to_chan_dim(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert complex tensor to channel dimension."""
+        b, c, h, w, two = x.shape
+        assert two == 2
+        return x.permute(0, 1, 4, 2, 3).reshape(b, c * 2, h, w)
+
 
 # For backward compatibility with your existing code
 def build_sme_model(args):
     """Build SME model from args"""
+    # FIXED: Get num_coils from args or use default
+    num_coils = getattr(args, 'num_coils', 15)
+    
     model = SensitivityModel(
         chans=args.sens_chans,
         num_pools=args.sens_pools,
         num_adjacent=args.num_adjacent,
-        use_prompts=args.use_prompts if hasattr(args, 'use_prompts') else True
+        use_prompts=getattr(args, 'use_prompts', True),
+        num_coils=num_coils  # FIXED: Pass num_coils
     )
     return model
