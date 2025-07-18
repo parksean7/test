@@ -14,9 +14,9 @@ python train_sme.py \
     --batch-size 1 \
     --num-epochs 50 \
     --lr 3e-4 \
-    --sens_chans 2 \
-    --sens_pools 2 \
-    --num_adjacent 3 \
+    --sens_chans 8 \
+    --sens_pools 4 \
+    --num_adjacent 5 \
     --loss-type mse \
     --enable-checkpointing \
     --data-path-train /root/Data/train/ \

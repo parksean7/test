@@ -26,8 +26,8 @@ def parse():
     parser.add_argument('-v', '--data-path-val', type=Path, default='/root/Data/val/', help='Directory of validation data')
     
     # SME specific parameters
-    parser.add_argument('--sens_chans', type=int, default=3, help='Number of channels for SME U-Net')
-    parser.add_argument('--sens_pools', type=int, default=3, help='Number of pooling layers for SME U-Net')
+    parser.add_argument('--sens_chans', type=int, default=8, help='Number of channels for SME U-Net')
+    parser.add_argument('--sens_pools', type=int, default=4, help='Number of pooling layers for SME U-Net')
     parser.add_argument('--num_adjacent', type=int, default=5, help='Number of adjacent slices (2a+1)')
     parser.add_argument('--use_prompts', action='store_true', help='Use prompt learning in SME')
     
