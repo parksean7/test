@@ -167,6 +167,7 @@ class SensitivityModel(nn.Module):
         super().__init__()
         
         self.num_adjacent = num_adjacent
+        self.num_pools = num_pools  # ADD THIS LINE
         self.use_prompts = use_prompts
         
         # Important: Match the expected input/output channels
@@ -192,43 +193,51 @@ class SensitivityModel(nn.Module):
         """
         Args:
             input_images: Magnitude images [B, num_adjacent, H, W]
-            mask: Sampling mask [B, 1, H, W]
+            mask: Sampling mask [B, H, W] or [B, 1, H, W]
         Returns:
-            sens_maps: Sensitivity maps [B, num_coils, H, W, 2]
+            sens_maps: Sensitivity maps [B, 1, H, W, 2] (will be expanded later)
         """
         b, n_adj, h, w = input_images.shape
-        
-        # For now, estimate single-coil sensitivity (unity)
-        # In full implementation, this would estimate multi-coil sensitivities
-        # You'll need to adapt this based on your specific coil configuration
-        
+    
+        # Calculate padding needed for U-Net compatibility
+        # U-Net with num_pools requires dimensions divisible by 2^num_pools
+        pad_factor = 2 ** self.num_pools  # 16 for num_pools=4
+    
+        # Calculate padding for height and width
+        pad_h = (pad_factor - (h % pad_factor)) % pad_factor
+        pad_w = (pad_factor - (w % pad_factor)) % pad_factor
+    
+        # Apply padding if needed
+        if pad_h > 0 or pad_w > 0:
+            # Pad: (left, right, top, bottom)
+            padding = (0, pad_w, 0, pad_h)
+            input_padded = F.pad(input_images, padding, mode='reflect')
+        else:
+            input_padded = input_images
+    
         # Process through U-Net
-        sens_output = self.norm_unet(input_images)  # [B, 2, H, W]
-        
+        sens_output = self.norm_unet(input_padded)  # [B, 2, H_pad, W_pad]
+    
+        # Crop back to original dimensions if padding was applied
+        if pad_h > 0 or pad_w > 0:
+            sens_output = sens_output[:, :, :h, :w]  # [B, 2, H, W]
+    
         # Normalize output
         sens_output = self.output_norm(sens_output)
-        
+    
         # Apply activation to ensure unit norm
         # Split real and imaginary parts
         sens_real = sens_output[:, 0:1, :, :]  # [B, 1, H, W]
         sens_imag = sens_output[:, 1:2, :, :]  # [B, 1, H, W]
-        
+    
         # Normalize to unit norm
         sens_mag = torch.sqrt(sens_real**2 + sens_imag**2 + 1e-8)
         sens_real = sens_real / sens_mag
         sens_imag = sens_imag / sens_mag
-        
+    
         # Stack to create complex representation
         sens_maps = torch.stack([sens_real, sens_imag], dim=-1)  # [B, 1, H, W, 2]
-        
-        # For multi-coil, you would repeat or estimate multiple maps
-        # For now, returning single coil sensitivity
-        # In practice, you need to modify this to return [B, num_coils, H, W, 2]
-        
-        # Assuming 15 coils as in your original setup (3 coils per adjacent slice)
-        num_coils = 15  # Adjust based on your data
-        sens_maps = sens_maps.repeat(1, num_coils, 1, 1, 1)  # [B, num_coils, H, W, 2]
-        
+    
         return sens_maps
 
     def complex_to_chan_dim(self, x: torch.Tensor) -> torch.Tensor:

@@ -91,7 +91,7 @@ def estimate_sensitivity_maps(kspace, mask=None, num_adjacent=5):
 
     # Use center k-space region
     center_fraction = 0.08
-    center_lines = int(H * center_fraction)
+    center_lines = max(int(H * center_fraction), 24)
     start_line = (H - center_lines) // 2
     end_line = start_line + center_lines
 
@@ -106,8 +106,8 @@ def estimate_sensitivity_maps(kspace, mask=None, num_adjacent=5):
     # Magnitude before interpolation
     center_magnitude = torch.abs(center_images)  # [B, C, h_center, W], float
 
-    # Upsample to full resolution
-    target_size = (768, 384)
+    # **FIX: Use original spatial dimensions instead of hardcoded (768, 384)**
+    target_size = (H, W)  # Use original dimensions
     center_images_full = torch.nn.functional.interpolate(
         center_magnitude, size=target_size, mode="bilinear", align_corners=False
     )  # [B, C, H, W], float
@@ -123,7 +123,6 @@ def estimate_sensitivity_maps(kspace, mask=None, num_adjacent=5):
     sens_maps_real = torch.stack([sens_maps, torch.zeros_like(sens_maps)], dim=-1)  # [B, C, H, W, 2]
 
     return sens_maps_real
-
 
 def train_sme_epoch(args, epoch, model, data_loader, optimizer, loss_type):
     """Train SME model for one epoch"""
@@ -150,21 +149,29 @@ def train_sme_epoch(args, epoch, model, data_loader, optimizer, loss_type):
         if sme_input.dim() == 5:
             sme_input = sme_input.squeeze(1)  # Remove channel dim if present
         
-        # Get sensitivity maps prediction
-        sens_maps_pred = model(sme_input, mask.squeeze(-1))  # [B, coils, H, W, 2]
+        # Get sensitivity maps prediction - now returns [B, 1, H, W, 2]
+        sens_maps_pred = model(sme_input, mask.squeeze(-1))
+
+        # Expand to match the actual coil count from input kspace
+        B, C, H, W, _ = kspace.shape
+        if sens_maps_pred.shape[1] == 1 and C > 1:
+            # Repeat single coil sensitivity for all coils
+            sens_maps_pred = sens_maps_pred.repeat(1, C, 1, 1, 1)  # [B, C, H, W, 2]
         
         # Compute "ground truth" sensitivity maps from fully sampled center
         sens_maps_gt = estimate_sensitivity_maps(kspace, mask, args.num_adjacent)
         sens_maps_gt = sens_maps_gt.to(device)
         
-        # Ensure compatible shapes
+        # Ensure compatible shapes (should now match)
         if sens_maps_pred.shape != sens_maps_gt.shape:
             print(f"Shape mismatch: pred {sens_maps_pred.shape}, gt {sens_maps_gt.shape}")
-            # Adjust number of coils if needed
-            if sens_maps_pred.shape[1] != sens_maps_gt.shape[1]:
-                min_coils = min(sens_maps_pred.shape[1], sens_maps_gt.shape[1])
-                sens_maps_pred = sens_maps_pred[:, :min_coils]
-                sens_maps_gt = sens_maps_gt[:, :min_coils]
+            # Handle any remaining mismatches by taking minimum dimensions
+            min_coils = min(sens_maps_pred.shape[1], sens_maps_gt.shape[1])
+            min_h = min(sens_maps_pred.shape[2], sens_maps_gt.shape[2])
+            min_w = min(sens_maps_pred.shape[3], sens_maps_gt.shape[3])
+    
+            sens_maps_pred = sens_maps_pred[:, :min_coils, :min_h, :min_w, :]
+            sens_maps_gt = sens_maps_gt[:, :min_coils, :min_h, :min_w, :]
         
         # Compute loss
         if loss_type == 'mse':
