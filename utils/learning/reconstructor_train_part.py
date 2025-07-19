@@ -19,6 +19,8 @@ from utils.model.promptmr_reconstructor import PromptMRPlusReconstructor, Recons
 import os
 
 
+# CRITICAL FIX: Ensure data loader compatibility for reconstructor training
+
 def train_reconstructor_epoch(args, epoch, sme_model, reconstructor_model, data_loader, optimizer, loss_type):
     """Train reconstructor for one epoch"""
     sme_model.eval()  # SME model is frozen
@@ -32,7 +34,14 @@ def train_reconstructor_epoch(args, epoch, sme_model, reconstructor_model, data_
     accumulation_steps = getattr(args, 'accumulation_steps', 4)
 
     for iter, data in enumerate(data_loader):
-        mask, kspace, target, maximum, _, _, sme_input = data
+        # FIXED: Handle both 6-item and 7-item data unpacking
+        if len(data) == 7:
+            # Reconstructor data format
+            mask, kspace, target, maximum, fnames, slices, sme_input = data
+        else:
+            # SME data format - need to compute sme_input
+            mask, kspace, target, maximum, fnames, slices = data
+            sme_input = compute_sme_input(kspace, slices, args.num_adjacent)
         
         # Move to device
         device = next(sme_model.parameters()).device
@@ -42,10 +51,32 @@ def train_reconstructor_epoch(args, epoch, sme_model, reconstructor_model, data_
         maximum = maximum.to(device, non_blocking=True)
         sme_input = sme_input.to(device, non_blocking=True)
 
+        # FIXED: Ensure sme_input has correct shape
+        if sme_input.dim() == 5:
+            sme_input = sme_input.squeeze(1)  # [B, 1, num_adj, H, W] -> [B, num_adj, H, W]
+        
         # Get sensitivity maps from frozen SME model
-        sme_input = sme_input.squeeze(1)  # [B, 1, num_adj, H, W] -> [B, num_adj, H, W]
         with torch.no_grad():
             sens_maps = sme_model(sme_input, mask.squeeze(-1))
+
+        # FIXED: Ensure kspace and sens_maps have compatible coil dimensions
+        B_k, C_k, H_k, W_k, _ = kspace.shape
+        B_s, C_s, H_s, W_s, _ = sens_maps.shape
+        
+        if C_k != C_s:
+            # Adjust sensitivity maps to match kspace coil count
+            if C_s == 1 and C_k > 1:
+                # Repeat single coil for all coils
+                sens_maps = sens_maps.repeat(1, C_k, 1, 1, 1)
+            elif C_s > C_k:
+                # Truncate to match kspace
+                sens_maps = sens_maps[:, :C_k]
+            else:
+                # This shouldn't happen, but handle gracefully
+                print(f"Warning: Coil count mismatch - kspace: {C_k}, sens_maps: {C_s}")
+                min_coils = min(C_k, C_s)
+                kspace = kspace[:, :min_coils]
+                sens_maps = sens_maps[:, :min_coils]
 
         # Forward pass through reconstructor
         output = reconstructor_model(kspace, mask, sens_maps)
