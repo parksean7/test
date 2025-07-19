@@ -1,6 +1,6 @@
 import h5py
 import random
-from utils.data.transforms import DataTransform
+from transforms import DataTransform  # Use the simple, correct one
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import numpy as np
