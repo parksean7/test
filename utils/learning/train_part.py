@@ -11,6 +11,7 @@ from utils.data.load_data import create_data_loaders
 from utils.common.utils import save_reconstructions, ssim_loss
 from utils.common.loss_function import SSIMLoss
 from utils.model.varnet import VarNet
+from utils.model.promptmr_plus import PromptMRPlusModel, EnhancedSSIMLoss
 
 import os
 
@@ -28,7 +29,11 @@ def train_epoch(args, epoch, model, data_loader, optimizer, loss_type):
         maximum = maximum.cuda(non_blocking=True)
 
         output = model(kspace, mask)
-        loss = loss_type(output, target, maximum)
+        if hasattr(args, 'model_type') and args.model_type == 'promptmr_plus':
+            # Enhanced SSIM loss doesn't need maximum parameter
+            loss = loss_type(output, target)
+        else:
+            loss = loss_type(output, target, maximum)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -42,6 +47,7 @@ def train_epoch(args, epoch, model, data_loader, optimizer, loss_type):
                 f'Time = {time.perf_counter() - start_iter:.4f}s',
             )
             start_iter = time.perf_counter()
+    
     total_loss = total_loss / len_loader
     return total_loss, time.perf_counter() - start_epoch
 
@@ -94,15 +100,24 @@ def save_model(args, exp_dir, epoch, model, optimizer, best_val_loss, is_new_bes
         
 def train(args):
     device = torch.device(f'cuda:{args.GPU_NUM}' if torch.cuda.is_available() else 'cpu')
-    torch.cuda.set_device(device)
-    print('Current cuda device: ', torch.cuda.current_device())
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+        print('Current cuda device: ', torch.cuda.current_device())
+    else:
+        print('Using CPU device')
 
-    model = VarNet(num_cascades=args.cascade, 
-                   chans=args.chans, 
-                   sens_chans=args.sens_chans)
+    if args.model_type == 'promptmr_plus':
+        model = PromptMRPlusModel(num_cascades=args.cascade, 
+                                  chans=args.chans, 
+                                  sens_chans=args.sens_chans)
+        loss_type = EnhancedSSIMLoss().to(device=device)
+    else:
+        model = VarNet(num_cascades=args.cascade, 
+                       chans=args.chans, 
+                       sens_chans=args.sens_chans)
+        loss_type = SSIMLoss().to(device=device)
+    
     model.to(device=device)
-
-    loss_type = SSIMLoss().to(device=device)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
     best_val_loss = 1.

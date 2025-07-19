@@ -5,6 +5,7 @@ from collections import defaultdict
 from utils.common.utils import save_reconstructions
 from utils.data.load_data import create_data_loaders
 from utils.model.varnet import VarNet
+from utils.model.promptmr_plus import PromptMRPlusModel
 
 def test(args, model, data_loader):
     model.eval()
@@ -29,12 +30,20 @@ def test(args, model, data_loader):
 def forward(args):
 
     device = torch.device(f'cuda:{args.GPU_NUM}' if torch.cuda.is_available() else 'cpu')
-    torch.cuda.set_device(device)
-    print ('Current cuda device ', torch.cuda.current_device())
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+        print ('Current cuda device ', torch.cuda.current_device())
+    else:
+        print('Using CPU device')
 
-    model = VarNet(num_cascades=args.cascade, 
-                   chans=args.chans, 
-                   sens_chans=args.sens_chans)
+    if hasattr(args, 'model_type') and args.model_type == 'promptmr_plus':
+        model = PromptMRPlusModel(num_cascades=args.cascade, 
+                                  chans=args.chans, 
+                                  sens_chans=args.sens_chans)
+    else:
+        model = VarNet(num_cascades=args.cascade, 
+                       chans=args.chans, 
+                       sens_chans=args.sens_chans)
     model.to(device=device)
     
     checkpoint = torch.load(args.exp_dir / 'best_model.pt', map_location='cpu', weights_only=False)
