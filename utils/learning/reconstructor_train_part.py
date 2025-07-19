@@ -15,6 +15,7 @@ from utils.data.load_data import create_data_loaders
 from utils.common.utils import save_reconstructions, ssim_loss
 from utils.model.sme_model import SensitivityModel
 from utils.model.promptmr_reconstructor import PromptMRPlusReconstructor, ReconstructionLoss
+from utils.learning.sme_train_part import compute_sme_input
 
 import os
 

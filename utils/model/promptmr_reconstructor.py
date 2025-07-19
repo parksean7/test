@@ -506,19 +506,21 @@ class PromptMRPlusReconstructor(nn.Module):
 
 
 class ReconstructionLoss(nn.Module):
-    """Loss function for reconstruction training"""
+    """Loss function for reconstruction training - Modified to use existing SSIM implementation"""
     def __init__(self, loss_type='ssim'):
         super().__init__()
         self.loss_type = loss_type
         
         if loss_type == 'ssim':
-            from pytorch_msssim import SSIM
-            self.loss_fn = SSIM(data_range=1.0, size_average=True, channel=1)
+            # Use the existing SSIM implementation instead of pytorch_msssim
+            from utils.common.utils import ssim_loss as custom_ssim_loss
+            self.loss_fn = custom_ssim_loss
         elif loss_type == 'l1':
             self.loss_fn = nn.L1Loss()
         elif loss_type == 'combined':
-            from pytorch_msssim import SSIM
-            self.ssim = SSIM(data_range=1.0, size_average=True, channel=1)
+            # Use existing SSIM implementation for combined loss
+            from utils.common.utils import ssim_loss as custom_ssim_loss
+            self.ssim_fn = custom_ssim_loss
             self.l1 = nn.L1Loss()
     
     def forward(self, output, target, max_value):
@@ -532,18 +534,13 @@ class ReconstructionLoss(nn.Module):
         output_norm = output / max_value.view(-1, 1, 1)
         target_norm = target / max_value.view(-1, 1, 1)
         
-        # Add channel dimension for SSIM
-        if output_norm.dim() == 3:
-            output_norm = output_norm.unsqueeze(1)
-            target_norm = target_norm.unsqueeze(1)
-        
         if self.loss_type == 'ssim':
-            # Return 1 - SSIM as loss
-            return 1 - self.loss_fn(output_norm, target_norm)
+            # Use the existing ssim_loss function which already returns (1 - SSIM)
+            return self.loss_fn(target_norm, output_norm)
         elif self.loss_type == 'l1':
             return self.loss_fn(output_norm, target_norm)
         elif self.loss_type == 'combined':
-            ssim_loss = 1 - self.ssim(output_norm, target_norm)
+            ssim_loss = self.ssim_fn(target_norm, output_norm)
             l1_loss = self.l1(output_norm, target_norm)
             return 0.8 * ssim_loss + 0.2 * l1_loss
         else:
